@@ -1,6 +1,7 @@
 import { STATUS_CODES } from 'node:http';
 import Fastify from 'fastify';
 import { mergePatches, PatchError } from './merge.js';
+import { auditOrders } from './orderAudit.js';
 import { MergeStore } from './store.js';
 import { EXAMPLE_REQUEST, EXAMPLE_CONFLICT_REQUEST } from './example.js';
 
@@ -79,6 +80,8 @@ export function buildApp(options = {}) {
       'POST /api/v1/merges': 'rehearse a merge of { base, patchA, patchB }',
       'GET /api/v1/merges': 'list stored rehearsals',
       'GET /api/v1/merges/:id': 'fetch one rehearsal (inputs + outcome)',
+      'GET /api/v1/merges/:id/order-audit':
+        'replay saved inputs A->B and B->A under strict RFC 6902 ordering (commutativity audit)',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
     },
   }));
@@ -125,6 +128,19 @@ export function buildApp(options = {}) {
       });
     }
     return record;
+  });
+
+  app.get('/api/v1/merges/:id/order-audit', async (req, reply) => {
+    const record = store.get(req.params.id);
+    if (!record) {
+      return reply.code(404).send({
+        statusCode: 404,
+        error: 'Not Found',
+        message: `no rehearsal stored with id ${req.params.id}`,
+      });
+    }
+    const { base, patchA, patchB } = record;
+    return { id: record.id, createdAt: record.createdAt, ...auditOrders(base, patchA, patchB) };
   });
 
   app.delete('/api/v1/merges/:id', async (req, reply) => {

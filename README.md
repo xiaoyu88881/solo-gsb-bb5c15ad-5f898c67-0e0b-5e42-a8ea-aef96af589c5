@@ -54,6 +54,7 @@ npm ci && npm start
 | `POST` | `/api/v1/merges` | 执行合并预演，结果落内存存储 |
 | `GET` | `/api/v1/merges` | 列出全部预演记录（摘要） |
 | `GET` | `/api/v1/merges/:id` | 查询单条预演（含输入与结果） |
+| `GET` | `/api/v1/merges/:id/order-audit` | 顺序审计：对已保存输入按严格 RFC 6902 顺序分别重放 A→B / B→A |
 | `DELETE` | `/api/v1/merges/:id` | 删除单条预演（`204`） |
 
 ### `POST /api/v1/merges`
@@ -162,8 +163,89 @@ curl -s -X POST http://localhost:3000/api/v1/merges \
 curl -s http://localhost:3000/health | jq                 # 健康检查
 curl -s http://localhost:3000/api/v1/merges | jq          # 预演记录列表
 curl -s http://localhost:3000/api/v1/merges/<id> | jq     # 单条记录（含输入）
+curl -s http://localhost:3000/api/v1/merges/<id>/order-audit | jq  # 顺序审计
 curl -s -X DELETE http://localhost:3000/api/v1/merges/<id> # 删除记录
 ```
+
+### `GET /api/v1/merges/:id/order-audit`（顺序审计）
+
+合并预演采用「基准坐标」模型，不做顺序重放；而真实 RFC 6902 客户端是**逐条顺序执行**的——
+每条操作都作用在上一条的结果上，数组下标按当前数组解析，增删会造成漂移。本端点取出该条记录
+**已保存的原始输入**（`base` / `patchA` / `patchB`），按严格 RFC 6902 语义分别重放两种顺序，
+用于检验两组补丁在真实执行下是否可交换（commutative）。
+
+- `A->B`：先按序执行 `patchA` 的每一条，再执行 `patchB`；
+- `B->A`：先按序执行 `patchB` 的每一条，再执行 `patchA`。
+
+每组补丁内部：**第 i 条的路径相对第 i-1 条执行后的文档求值**，数组下标绝不沿用基准坐标
+（因此前一条的插入/删除会立刻影响后一条下标）。ID 不存在返回 `404`；无论审计结论为何，
+记录存在即返回 `200`（审计结论在响应体 `verdict` 中）。
+
+响应体：
+
+```jsonc
+{
+  "id": "…", "createdAt": "…",
+  "base": { /* 保存时的基准文档 */ },
+  "patchA": [ /* 保存时的原始 A 补丁 */ ],
+  "patchB": [ /* 保存时的原始 B 补丁 */ ],
+  "verdict": "commutative" | "divergent" | "failed",
+  "orders": {
+    "A->B": { "status": "applied", "steps": [ /* 见下 */ ], "result": {…}, "error": null },
+    "B->A": { "status": "applied", "steps": [ /* 见下 */ ], "result": {…}, "error": null }
+  }
+  // verdict=divergent 时另有 firstDifference / differences
+  // verdict=failed    时另有 failure
+}
+```
+
+`steps` 给出**逐操作轨迹**，顺序即真实执行顺序（跨补丁时 `side` 会切换）：
+
+```jsonc
+{
+  "side": "B",            // 该操作来自哪组补丁
+  "index": 1,             // 该操作在其原始补丁中的序号（0 起）
+  "op": "add",
+  "path": "/servers/1",
+  "value": { … },         // 仅 add/replace 携带；remove 不含
+  "afterExists": true,    // 执行后用该操作自己的 path 重新解析是否存在
+  "afterValue": { … }     // 执行后该 path 上的值（remove 后可能指向下标漂移进来的元素）
+}
+```
+
+三种结论：
+
+| `verdict` | 条件 | 附加字段 |
+| --- | --- | --- |
+| `commutative` | 两种顺序都成功且最终文档深度相等 | — |
+| `divergent` | 两种顺序都成功但结果不同 | `firstDifference`、`differences` |
+| `failed` | 至少一种顺序在某条操作上按 RFC 6902 无法应用（A→B 优先报告） | `failure` |
+
+- **失败**时 `failure` 为：`{ order, side, index, op, path, code, message, documentBefore }`——
+  `order` 为失败顺序（`A->B`/`B->A`），`side`+`index` 是失败操作的**失败方与原始序号**，
+  `documentBefore` 是该操作执行前的文档快照；该顺序的 `steps` 只保留失败前已成功的操作，
+  `result` 为 `null`。错误 `code` 取 RFC 6902 风格：`TARGET_NOT_FOUND` / `OUT_OF_BOUNDS` /
+  `INVALID_INDEX`（下标越界、含前导零、在非 add 中使用 `-`）/ `UNRESOLVABLE_PATH` /
+  `INVALID_POINTER` / `INVALID_OPERATION`。
+- **结果不同**时，递归下降到叶子差异（数组按下标、对象按成员），对全部差异的
+  **RFC 6901 转义路径按字典序（UTF-16 码元）排序**，`firstDifference` 为最小路径及其两侧值：
+  `{ path, aToB: { exists, value? }, bToA: { exists, value? } }`（`exists:false` 表示该路径在
+  该侧结果中不存在）；`differences` 为排序后的完整差异列表。
+- **结果相同**时标记 `commutative`。
+
+审计是已保存输入的纯函数：不依赖当前时间、不修改存储，**重复查询返回完全一致的响应体**。
+
+典型发现：基准坐标合并判为「干净」的记录，在严格顺序重放下可能并不可交换。例如内置示例中
+两组补丁都在 `servers` 缝隙 1 插入（基准模型固定 A 在 B 前），顺序重放时：
+
+```text
+A→B：servers = [a2, b2, b]    B→A：servers = [b, a2, b2]
+```
+
+`firstDifference.path = "/servers/0/host"`（两侧值分别为 `"a2.internal"` 与 `"b.internal"`）。
+
+失败示例：A 删除 `/a`、B 替换 `/a`（预演会存为冲突记录，仍可审计）——A→B 在 B#0 处失败
+（`TARGET_NOT_FOUND`，`documentBefore` 已不含 `a`），而 B→A 可以成功。
 
 ## 合并语义
 
@@ -214,7 +296,9 @@ npm test
 ```
 
 覆盖：指针转义、索引漂移重定位、同缝隙 A/B 定序、去重规则、全部冲突类型、
-非法补丁（`422`）、schema 校验（`400`）、存储的增删查、健康检查等。
+非法补丁（`422`）、schema 校验（`400`）、存储的增删查、健康检查、
+顺序审计（`commutative`/`divergent`/`failed`、最小字典序差异路径、失败方与原始序号、
+逐条执行轨迹、重复查询一致性、`404`）等。
 
 ## 项目结构
 
@@ -224,6 +308,7 @@ npm test
 ├── src/
 │   ├── app.js                 # Fastify 应用：路由、schema 校验、错误处理
 │   ├── merge.js               # 合并引擎：规范化 → 补丁内解析 → 跨补丁冲突检测 → 应用
+│   ├── orderAudit.js          # 顺序审计：严格 RFC 6902 重放 A→B / B→A、失败捕获与差异递归
 │   ├── store.js               # 内存存储（FIFO 淘汰）
 │   └── example.js             # 内置示例请求
 ├── test/                      # node:test 单元 + 集成测试
@@ -237,3 +322,8 @@ npm test
 - 存储为进程内存，重启即清空；如需持久化可在 `src/store.js` 替换实现。
 - 合并是确定性的：同一输入永远产生同一输出（冲突列表按路径与原因排序）。
 - 单补丁内操作按基准坐标解释，不做补丁内顺序重放；同路径多操作按 last-wins 处理（见上）。
+- 顺序审计（`/order-audit`）刻意采用与合并不同的模型：严格按 RFC 6902 逐条顺序执行，
+  路径与数组下标相对上一条结果解析；其结论可能与基准坐标合并不同（如插入顺序敏感）。
+  审计每次按已保存输入实时重算，纯函数无副作用，重复查询字节级一致。
+- 审计仅重放 `add` / `remove` / `replace`（与存储入口一致）；RFC 6902 数组下标严格要求
+  `0` 或非零开头的十进制数（`01` 非法），`-` 仅允许用于 `add` 的追加缝隙。
