@@ -136,8 +136,7 @@ test('POST /api/v1/merges with a patch that does not apply to base returns 422',
   assert.equal(body.details.index, 0);
 });
 
-test('list, fetch and delete rehearsals', async () => {
-  const created = await app.inject({
+test('list, fetch and delete rehearsals', async () => {  const created = await app.inject({
     method: 'POST',
     url: '/api/v1/merges',
     payload: { base: { x: 1 }, patchA: [], patchB: [] },
@@ -157,6 +156,150 @@ test('list, fetch and delete rehearsals', async () => {
 
 test('unknown routes return JSON 404', async () => {
   const res = await app.inject({ method: 'GET', url: '/nope' });
+  assert.equal(res.statusCode, 404);
+  assert.equal(res.json().error, 'Not Found');
+});
+
+/* --------------------------- GET .../order-audit -------------------------- */
+
+async function createAuditRecord(payload) {
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/v1/merges',
+    payload,
+  });
+  const { id } = created.json();
+  const res = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${id}/order-audit`,
+  });
+  assert.equal(res.statusCode, 200);
+  return res.json();
+}
+
+test('order-audit on the clean example: divergent, smallest diff at /servers/0/host', async () => {
+  const body = await createAuditRecord(EXAMPLE_REQUEST);
+  assert.equal(body.id, body.id);
+  assert.equal(body.verdict, 'divergent');
+  assert.equal(body.firstDifference.path, '/servers/0/host');
+  assert.equal(body.firstDifference.aValue, 'a2.internal');
+  assert.equal(body.firstDifference.bValue, 'b.internal');
+
+  for (const order of ['A->B', 'B->A']) {
+    const replay = body.orders[order];
+    assert.equal(replay.status, 'applied');
+    assert.equal(replay.failure, null);
+    assert.equal(replay.steps.length, 7);
+    // every step carries its executed path and post-execution value
+    for (const step of replay.steps) {
+      assert.equal(typeof step.path, 'string');
+      assert.ok('afterValue' in step);
+      assert.equal(step.order, order);
+    }
+  }
+  // A then B: A inserts a2 at gap 1, then B removes current [0] (a.internal)
+  // and B's "/servers/1" now points at a2, so b2 lands first.
+  assert.deepEqual(
+    body.orders['A->B'].finalDocument.servers.map((s) => s.host),
+    ['a2.internal', 'b2.internal', 'b.internal'],
+  );
+  // B then A: b2 is inserted, then A's "/servers/1" points at b2.
+  assert.deepEqual(
+    body.orders['B->A'].finalDocument.servers.map((s) => s.host),
+    ['b.internal', 'a2.internal', 'b2.internal'],
+  );
+});
+
+test('order-audit marks disjoint patches commutative and replays them fully', async () => {
+  const body = await createAuditRecord({
+    base: { a: 1, b: 2 },
+    patchA: [{ op: 'replace', path: '/a', value: 10 }],
+    patchB: [{ op: 'add', path: '/c', value: 30 }],
+  });
+  assert.equal(body.verdict, 'commutative');
+  assert.equal(body.firstDifference, null);
+  assert.deepEqual(body.orders['A->B'].finalDocument, { a: 10, b: 2, c: 30 });
+  assert.deepEqual(body.orders['B->A'].finalDocument, { a: 10, b: 2, c: 30 });
+  assert.deepEqual(
+    body.orders['B->A'].steps.map((s) => [s.side, s.index]),
+    [
+      ['B', 0],
+      ['A', 0],
+    ],
+  );
+});
+
+test('order-audit reports failing side, original index and document-before-failure', async () => {
+  const body = await createAuditRecord({
+    base: { l: [{ h: 'a' }, { h: 'b' }] },
+    patchA: [{ op: 'remove', path: '/l/0' }],
+    patchB: [{ op: 'replace', path: '/l/1/h', value: 'x' }],
+  });
+  assert.equal(body.verdict, 'failed');
+  const ab = body.orders['A->B'];
+  assert.equal(ab.status, 'failed');
+  assert.equal(ab.finalDocument, null);
+  assert.equal(ab.steps.length, 1);
+  assert.deepEqual(ab.steps[0], {
+    order: 'A->B',
+    side: 'A',
+    index: 0,
+    op: 'remove',
+    path: '/l/0',
+    afterExists: false,
+    afterValue: null,
+    removedValue: { h: 'a' },
+  });
+  assert.deepEqual(
+    {
+      order: ab.failure.order,
+      side: ab.failure.side,
+      index: ab.failure.index,
+      op: ab.failure.op,
+      path: ab.failure.path,
+      code: ab.failure.code,
+    },
+    {
+      order: 'A->B',
+      side: 'B',
+      index: 0,
+      op: 'replace',
+      path: '/l/1/h',
+      code: 'OUT_OF_BOUNDS',
+    },
+  );
+  assert.deepEqual(ab.failure.documentBefore, { l: [{ h: 'b' }] });
+  // the reverse order applied fully
+  assert.equal(body.orders['B->A'].status, 'applied');
+  assert.deepEqual(body.orders['B->A'].finalDocument, { l: [{ h: 'x' }] });
+});
+
+test('order-audit answers are byte-for-byte identical on repeated queries', async () => {
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/v1/merges',
+    payload: EXAMPLE_REQUEST,
+  });
+  const { id } = created.json();
+  const first = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${id}/order-audit`,
+  });
+  const second = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${id}/order-audit`,
+  });
+  assert.equal(first.statusCode, 200);
+  assert.equal(second.statusCode, 200);
+  assert.equal(first.body, second.body);
+  assert.deepEqual(first.json(), second.json());
+});
+
+test('order-audit for an unknown id returns 404', async () => {
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/v1/merges/does-not-exist/order-audit',
+  });
   assert.equal(res.statusCode, 404);
   assert.equal(res.json().error, 'Not Found');
 });

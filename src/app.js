@@ -1,6 +1,7 @@
 import { STATUS_CODES } from 'node:http';
 import Fastify from 'fastify';
 import { mergePatches, PatchError } from './merge.js';
+import { auditOrdering } from './audit.js';
 import { MergeStore } from './store.js';
 import { EXAMPLE_REQUEST, EXAMPLE_CONFLICT_REQUEST } from './example.js';
 
@@ -38,6 +39,9 @@ export function buildApp(options = {}) {
     logger: options.logger ?? { level: options.logLevel || 'info' },
   });
   const store = new MergeStore({ max: options.storeMax ?? 1000 });
+  // Audit results are deterministic; cache per stored record so repeated
+  // queries serialize byte-for-byte without re-running the replays.
+  const audits = new WeakMap();
   const startedAt = Date.now();
 
   app.setNotFoundHandler((req, reply) => {
@@ -79,6 +83,8 @@ export function buildApp(options = {}) {
       'POST /api/v1/merges': 'rehearse a merge of { base, patchA, patchB }',
       'GET /api/v1/merges': 'list stored rehearsals',
       'GET /api/v1/merges/:id': 'fetch one rehearsal (inputs + outcome)',
+      'GET /api/v1/merges/:id/order-audit':
+        'replay saved patches A→B and B→A under strict RFC 6902 ordering (commutative / divergent / failed)',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
     },
   }));
@@ -125,6 +131,31 @@ export function buildApp(options = {}) {
       });
     }
     return record;
+  });
+
+  app.get('/api/v1/merges/:id/order-audit', async (req, reply) => {
+    const record = store.get(req.params.id);
+    if (!record) {
+      return reply.code(404).send({
+        statusCode: 404,
+        error: 'Not Found',
+        message: `no rehearsal stored with id ${req.params.id}`,
+      });
+    }
+    let result = audits.get(record);
+    if (!result) {
+      result = auditOrdering({
+        base: record.base,
+        patchA: record.patchA,
+        patchB: record.patchB,
+      });
+      audits.set(record, result);
+    }
+    return {
+      id: record.id,
+      createdAt: record.createdAt,
+      ...result,
+    };
   });
 
   app.delete('/api/v1/merges/:id', async (req, reply) => {
